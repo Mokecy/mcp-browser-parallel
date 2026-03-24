@@ -1,0 +1,53 @@
+{
+  "name": "mcp-browser-parallel",
+  "version": "1.0.0",
+  "description": "Multi-instance parallel browser MCP server with isolated browser contexts and automatic auth cloning. Manage multiple isolated browser instances within a single Chrome process for parallel test execution.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-browser-parallel": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "npx tsx src/index.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "playwright",
+    "browser",
+    "parallel",
+    "testing",
+    "automation",
+    "multi-instance",
+    "isolated",
+    "chrome",
+    "cdp"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "homepage": "",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "playwright": "^1.52.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.2",
+    "typescript": "^5.8.3",
+    "tsx": "^4.19.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
