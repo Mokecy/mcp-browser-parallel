@@ -1,20 +1,37 @@
 /**
- * Take an accessibility snapshot of the page, assign refs to interactive nodes,
- * and return a formatted text representation.
+ * Take an accessibility snapshot of the page using Playwright's native snapshotForAI().
+ * Returns the structured YAML-like aria snapshot text with [ref=eN] markers.
  */
 export async function takeSnapshot(instance) {
-    // Clear previous refs
-    instance.clearRefs();
-    // @ts-ignore - accessibility API exists at runtime but types may vary across versions
-    const snapshot = await instance.page.accessibility.snapshot();
-    if (!snapshot) {
-        return '(empty page - no accessible content)';
+    const page = instance.page;
+    try {
+        // Use Playwright's native snapshotForAI() which returns aria snapshot with refs
+        const snapshot = await page.snapshotForAI({ track: 'response' });
+        // Store the full snapshot for reference
+        instance.lastSnapshot = snapshot.full || snapshot;
+        instance.lastSnapshotDiff = snapshot.incremental;
+        return typeof snapshot === 'string' ? snapshot : (snapshot.full || JSON.stringify(snapshot));
     }
-    // Track role+name counts for disambiguation
-    const globalCounts = new Map();
-    const lines = [];
-    processNode(snapshot, 0, instance, globalCounts, lines);
-    return lines.join('\n');
+    catch (e) {
+        // Fallback: try the older accessibility.snapshot() API
+        console.error(`snapshotForAI not available, falling back to accessibility.snapshot(): ${e.message}`);
+        return await takeSnapshotLegacy(instance);
+    }
+}
+/**
+ * Get a Playwright Locator for a ref from the snapshot.
+ * Uses the native aria-ref= locator system built into Playwright.
+ */
+export function getLocator(instance, ref) {
+    const page = instance.page;
+    try {
+        // Use Playwright's native aria-ref= locator (the same as official MCP)
+        return page.locator(`aria-ref=${ref}`);
+    }
+    catch (e) {
+        // Fallback to legacy ref map
+        return getLocatorLegacy(instance, ref);
+    }
 }
 const INTERACTIVE_ROLES = new Set([
     'link', 'button', 'textbox', 'searchbox', 'combobox',
@@ -23,13 +40,21 @@ const INTERACTIVE_ROLES = new Set([
     'tab', 'treeitem', 'option', 'listbox',
     'cell', 'columnheader', 'rowheader', 'row',
 ]);
-function isInteractive(role) {
-    return INTERACTIVE_ROLES.has(role);
+async function takeSnapshotLegacy(instance) {
+    instance.clearRefs();
+    // @ts-ignore
+    const snapshot = await instance.page.accessibility.snapshot();
+    if (!snapshot) {
+        return '(empty page - no accessible content)';
+    }
+    const globalCounts = new Map();
+    const lines = [];
+    processNode(snapshot, 0, instance, globalCounts, lines);
+    return lines.join('\n');
 }
 function processNode(node, depth, instance, globalCounts, lines) {
     const indent = '  '.repeat(depth);
-    const interactive = isInteractive(node.role);
-    // Assign ref to interactive elements
+    const interactive = INTERACTIVE_ROLES.has(node.role);
     let refStr = '';
     if (interactive) {
         const ref = `e${instance.refCounter}`;
@@ -44,11 +69,9 @@ function processNode(node, depth, instance, globalCounts, lines) {
         });
         refStr = ` [ref=${ref}]`;
     }
-    // Build line
     let line = `${indent}- ${node.role}`;
     if (node.name)
         line += ` "${truncate(node.name, 80)}"`;
-    // Attributes
     const attrs = [];
     if (node.value !== undefined)
         attrs.push(`value="${truncate(node.value, 50)}"`);
@@ -70,17 +93,13 @@ function processNode(node, depth, instance, globalCounts, lines) {
         line += ` (${attrs.join(', ')})`;
     line += refStr;
     lines.push(line);
-    // Process children
     if (node.children) {
         for (const child of node.children) {
             processNode(child, depth + 1, instance, globalCounts, lines);
         }
     }
 }
-/**
- * Get a Playwright Locator for a ref from the snapshot.
- */
-export function getLocator(instance, ref) {
+function getLocatorLegacy(instance, ref) {
     const info = instance.refMap.get(ref);
     if (!info) {
         const available = Array.from(instance.refMap.keys()).slice(0, 10).join(', ');
@@ -89,14 +108,12 @@ export function getLocator(instance, ref) {
     }
     const page = instance.page;
     let locator;
-    // Build locator from role and name
     if (info.name) {
         locator = page.getByRole(info.role, { name: info.name });
     }
     else {
         locator = page.getByRole(info.role);
     }
-    // Use nth() to disambiguate if there are multiple matches
     if (info.globalIndex > 0) {
         locator = locator.nth(info.globalIndex);
     }

@@ -3,8 +3,13 @@
  *
  * Manages multiple isolated browser contexts within a single Chrome process.
  * Supports auth cloning via Playwright's storageState.
+ *
+ * Aligned with the official Playwright MCP implementation:
+ * - waitForCompletion for action stabilization
+ * - Native snapshot storage
+ * - Modal state tracking (dialog/fileChooser)
  */
-import { BrowserContext, Page, type Cookie } from 'playwright';
+import { BrowserContext, Page, type Cookie, Dialog } from 'playwright';
 export interface InstanceInfo {
     id: string;
     url: string;
@@ -21,14 +26,23 @@ export interface StorageStateData {
         }>;
     }>;
 }
+export interface ModalState {
+    type: 'dialog' | 'fileChooser';
+    description: string;
+    dialog?: Dialog;
+    fileChooser?: any;
+}
 export declare class BrowserInstance {
     readonly id: string;
     context: BrowserContext;
     page: Page;
     private _refMap;
     private _refCounter;
+    lastSnapshot: string;
+    lastSnapshotDiff: string | undefined;
     private _consoleMessages;
     private _networkRequests;
+    private _modalStates;
     constructor(id: string, context: BrowserContext, page: Page);
     private _setupListeners;
     get consoleMessages(): {
@@ -43,10 +57,22 @@ export declare class BrowserInstance {
         resourceType: string;
         timestamp: number;
     }[];
+    get modalStates(): ModalState[];
     get refMap(): Map<string, RefInfo>;
     get refCounter(): number;
     set refCounter(val: number);
     clearRefs(): void;
+    clearModalState(state: ModalState): void;
+    hasModalState(): boolean;
+    /**
+     * Wait for completion after an action (aligned with official Playwright MCP).
+     * Monitors network requests triggered by the action and waits for them to settle.
+     */
+    waitForCompletion(callback: () => Promise<void>): Promise<void>;
+    /**
+     * Safe timeout that works even when dialog is blocking JS execution
+     */
+    private _waitForTimeout;
 }
 export interface RefInfo {
     role: string;
@@ -60,15 +86,13 @@ export declare class BrowserInstanceManager {
     private cdpUrl;
     /**
      * Connect to an existing Chrome instance via CDP.
-     * Chrome must be running with --remote-debugging-port.
      */
     connect(cdpUrl?: string): Promise<{
         pageCount: number;
         url: string;
     }>;
     /**
-     * Extract authentication state (cookies + localStorage) from existing Chrome page.
-     * This enables cloning auth to new isolated instances without re-login.
+     * Extract authentication state from existing Chrome page.
      */
     extractAuth(pageIndex?: number): Promise<{
         cookieCount: number;
@@ -76,43 +100,15 @@ export declare class BrowserInstanceManager {
     }>;
     /**
      * Create a new isolated browser instance with optional auth cloning.
-     * Each instance has its own BrowserContext (cookies, storage, cache are isolated).
      */
     createInstance(id: string, url?: string, cloneAuth?: boolean): Promise<InstanceInfo>;
-    /**
-     * Get an instance by ID.
-     */
     getInstance(id: string): BrowserInstance;
-    /**
-     * List all active instances.
-     */
     listInstances(): Promise<InstanceInfo[]>;
-    /**
-     * Close a specific instance.
-     */
     closeInstance(id: string): Promise<void>;
-    /**
-     * Close all instances.
-     */
     closeAll(): Promise<number>;
-    /**
-     * Maximize window via CDP protocol.
-     */
     maximizeWindow(instanceId: string): Promise<void>;
-    /**
-     * Check if manager has auth state saved.
-     */
     get hasAuth(): boolean;
-    /**
-     * Check if connected to a browser.
-     */
     get isConnected(): boolean;
-    /**
-     * Disconnect from browser (does not close Chrome).
-     */
     private disconnectBrowser;
-    /**
-     * Clean up all resources.
-     */
     dispose(): Promise<void>;
 }

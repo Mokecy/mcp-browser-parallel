@@ -3,6 +3,14 @@
  * 
  * Provides MCP tools for managing multiple isolated browser instances.
  * Each tool takes an instanceId parameter to specify which instance to operate on.
+ * 
+ * Aligned with the official Playwright MCP implementation:
+ * - Uses snapshotForAI() + aria-ref= locator system
+ * - waitForCompletion for click/type/fill/hover/select actions
+ * - Modal state handling (dialog/fileChooser)
+ * - Proper navigate with waitForLoadState
+ * - dblclick() for double clicks
+ * - locator.fill() / locator.pressSequentially() for type
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -22,7 +30,7 @@ const manager = new BrowserInstanceManager();
 
 export function createServer(config: ServerConfig = {}): Server {
   const server = new Server(
-    { name: 'mcp-browser-parallel', version: '1.0.0' },
+    { name: 'mcp-browser-parallel', version: '1.1.0' },
     { capabilities: { tools: {} } },
   );
 
@@ -141,6 +149,11 @@ export function createServer(config: ServerConfig = {}): Server {
               type: 'boolean',
               description: 'Double click. Default: false',
             },
+            modifiers: {
+              type: 'array',
+              items: { type: 'string', enum: ['Alt', 'Control', 'ControlOrMeta', 'Meta', 'Shift'] },
+              description: 'Modifier keys to press',
+            },
           },
           required: ['instanceId', 'ref'],
         },
@@ -160,17 +173,20 @@ export function createServer(config: ServerConfig = {}): Server {
       },
       {
         name: 'page_type',
-        description: 'Type text into a focused element character by character. Useful for triggering input handlers. Use page_fill for fast input.',
+        description: 'Type text into editable element. By default fills at once; set slowly=true to type character by character.',
         inputSchema: {
           type: 'object' as const,
           properties: {
             instanceId: { type: 'string', description: 'Target instance' },
-            ref: { type: 'string', description: 'Element ref to focus and type into' },
+            ref: { type: 'string', description: 'Element ref to type into' },
             text: { type: 'string', description: 'Text to type' },
-            delay: {
-              type: 'number',
-              description: 'Delay between key presses in ms. Default: 50',
-              default: 50,
+            submit: {
+              type: 'boolean',
+              description: 'Whether to press Enter after typing. Default: false',
+            },
+            slowly: {
+              type: 'boolean',
+              description: 'Whether to type one character at a time. Useful for triggering key handlers. Default: false',
             },
           },
           required: ['instanceId', 'ref', 'text'],
@@ -269,8 +285,6 @@ export function createServer(config: ServerConfig = {}): Server {
           required: ['instanceId'],
         },
       },
-
-      // === Missing tools from Playwright MCP ===
       {
         name: 'page_navigate_back',
         description: 'Go back to the previous page in history.',
@@ -338,6 +352,11 @@ export function createServer(config: ServerConfig = {}): Server {
                 type: 'object',
                 properties: {
                   ref: { type: 'string', description: 'Element ref' },
+                  type: { 
+                    type: 'string', 
+                    enum: ['textbox', 'checkbox', 'radio', 'combobox', 'slider'],
+                    description: 'Type of the field',
+                  },
                   value: { type: 'string', description: 'Value to fill' },
                 },
                 required: ['ref', 'value'],
@@ -598,10 +617,23 @@ export function createServer(config: ServerConfig = {}): Server {
         // === Page Operations ===
         case 'page_navigate': {
           const instance = manager.getInstance(args?.instanceId as string);
-          const url = args?.url as string;
+          let url = args?.url as string;
           const waitUntil = (args?.waitUntil as any) || 'domcontentloaded';
 
+          // URL normalization (aligned with official)
+          try {
+            new URL(url);
+          } catch {
+            if (url.startsWith('localhost'))
+              url = 'http://' + url;
+            else
+              url = 'https://' + url;
+          }
+
           await instance.page.goto(url, { waitUntil, timeout: 30000 });
+          // Aligned with official: also wait for load state after goto
+          await instance.page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
+
           return text(`✅ Navigated to: ${instance.page.url()}\nTitle: ${await instance.page.title()}`);
         }
 
@@ -619,47 +651,90 @@ export function createServer(config: ServerConfig = {}): Server {
           const locator = getLocator(instance, args?.ref as string);
           const options: any = {};
           if (args?.button) options.button = args.button;
-          if (args?.doubleClick) options.clickCount = 2;
+          if (args?.modifiers) options.modifiers = args.modifiers;
 
-          await locator.click(options);
-          return text(`✅ Clicked [ref=${args?.ref}]`);
+          // Aligned with official: use waitForCompletion + dblclick for double click
+          await instance.waitForCompletion(async () => {
+            if (args?.doubleClick) {
+              await locator.dblclick(options);
+            } else {
+              await locator.click(options);
+            }
+          });
+
+          return text(`✅ Clicked [ref=${args?.ref}]${args?.doubleClick ? ' (double click)' : ''}`);
         }
 
         case 'page_fill': {
           const instance = manager.getInstance(args?.instanceId as string);
           const locator = getLocator(instance, args?.ref as string);
-          await locator.fill(args?.value as string);
+          
+          // Aligned with official: use waitForCompletion
+          await instance.waitForCompletion(async () => {
+            await locator.fill(args?.value as string);
+          });
+          
           return text(`✅ Filled [ref=${args?.ref}] with "${args?.value}"`);
         }
 
         case 'page_type': {
           const instance = manager.getInstance(args?.instanceId as string);
           const locator = getLocator(instance, args?.ref as string);
-          await locator.click(); // Focus first
-          await instance.page.keyboard.type(args?.text as string, {
-            delay: (args?.delay as number) || 50,
+
+          // Aligned with official: use locator.fill() or locator.pressSequentially()
+          await instance.waitForCompletion(async () => {
+            if (args?.slowly) {
+              await locator.pressSequentially(args?.text as string);
+            } else {
+              await locator.fill(args?.text as string);
+            }
+
+            if (args?.submit) {
+              await locator.press('Enter');
+            }
           });
-          return text(`✅ Typed into [ref=${args?.ref}]: "${args?.text}"`);
+
+          return text(`✅ Typed into [ref=${args?.ref}]: "${args?.text}"${args?.submit ? ' (submitted)' : ''}`);
         }
 
         case 'page_select_option': {
           const instance = manager.getInstance(args?.instanceId as string);
           const locator = getLocator(instance, args?.ref as string);
-          await locator.selectOption(args?.values as string[]);
+          
+          // Aligned with official: use waitForCompletion
+          await instance.waitForCompletion(async () => {
+            await locator.selectOption(args?.values as string[]);
+          });
+          
           return text(`✅ Selected option(s) in [ref=${args?.ref}]`);
         }
 
         case 'page_hover': {
           const instance = manager.getInstance(args?.instanceId as string);
           const locator = getLocator(instance, args?.ref as string);
-          await locator.hover();
+          
+          // Aligned with official: use waitForCompletion
+          await instance.waitForCompletion(async () => {
+            await locator.hover();
+          });
+          
           return text(`✅ Hovered over [ref=${args?.ref}]`);
         }
 
         case 'page_press_key': {
           const instance = manager.getInstance(args?.instanceId as string);
-          await instance.page.keyboard.press(args?.key as string);
-          return text(`✅ Pressed key: ${args?.key}`);
+          const key = args?.key as string;
+          
+          // Aligned with official: Enter key uses waitForCompletion
+          if (key === 'Enter') {
+            await instance.waitForCompletion(async () => {
+              await instance.page.keyboard.press('Enter');
+            });
+          } else {
+            await instance.page.keyboard.press(key);
+          }
+          
+          return text(`✅ Pressed key: ${key}`);
         }
 
         case 'page_screenshot': {
@@ -682,26 +757,39 @@ export function createServer(config: ServerConfig = {}): Server {
           const instance = manager.getInstance(args?.instanceId as string);
           const timeout = (args?.timeout as number) || 10000;
 
+          // Aligned with official: time-based wait uses Node setTimeout with max 30s
           if (args?.time) {
-            await instance.page.waitForTimeout((args.time as number) * 1000);
+            const waitMs = Math.min(30000, (args.time as number) * 1000);
+            await new Promise(f => setTimeout(f, waitMs));
             return text(`✅ Waited ${args.time} seconds`);
           }
-          if (args?.text) {
-            await instance.page.getByText(args.text as string).waitFor({ timeout });
-            return text(`✅ Text appeared: "${args.text}"`);
-          }
+          
+          // Aligned with official: text gone check first, then text appear
           if (args?.textGone) {
-            await instance.page.getByText(args.textGone as string).waitFor({ state: 'hidden', timeout });
+            await instance.page.getByText(args.textGone as string).first().waitFor({ state: 'hidden', timeout });
             return text(`✅ Text disappeared: "${args.textGone}"`);
           }
+          if (args?.text) {
+            await instance.page.getByText(args.text as string).first().waitFor({ state: 'visible', timeout });
+            return text(`✅ Text appeared: "${args.text}"`);
+          }
 
-          return error('Specify text, textGone, or time.');
+          return error('Either time, text or textGone must be provided.');
         }
 
         case 'page_evaluate': {
           const instance = manager.getInstance(args?.instanceId as string);
-          const result = await instance.page.evaluate(args?.expression as string);
-          return text(`Result:\n${JSON.stringify(result, null, 2)}`);
+          let expression = args?.expression as string;
+          // Aligned with official: auto-wrap non-arrow expressions
+          if (!expression.includes('=>'))
+            expression = `() => (${expression})`;
+          let result: any;
+          await instance.waitForCompletion(async () => {
+            const func = new Function();
+            func.toString = () => expression;
+            result = await instance.page.evaluate(func as any);
+          });
+          return text(`Result:\n${JSON.stringify(result, null, 2) || 'undefined'}`);
         }
 
         case 'page_maximize': {
@@ -709,7 +797,7 @@ export function createServer(config: ServerConfig = {}): Server {
           return text(`✅ Window maximized for instance "${args?.instanceId}"`);
         }
 
-        // === New tools ===
+        // === Navigation ===
         case 'page_navigate_back': {
           const instance = manager.getInstance(args?.instanceId as string);
           await instance.page.goBack({ timeout: 30000 });
@@ -729,7 +817,12 @@ export function createServer(config: ServerConfig = {}): Server {
           const instance = manager.getInstance(args?.instanceId as string);
           const source = getLocator(instance, args?.startRef as string);
           const target = getLocator(instance, args?.endRef as string);
-          await source.dragTo(target);
+          
+          // Aligned with official: use waitForCompletion
+          await instance.waitForCompletion(async () => {
+            await source.dragTo(target);
+          });
+          
           return text(`✅ Dragged [ref=${args?.startRef}] to [ref=${args?.endRef}]`);
         }
 
@@ -737,16 +830,34 @@ export function createServer(config: ServerConfig = {}): Server {
           const instance = manager.getInstance(args?.instanceId as string);
           const locator = getLocator(instance, args?.ref as string);
           await locator.setInputFiles(args?.paths as string[]);
+          
+          // Clear file chooser modal state if any
+          const fileChooserState = instance.modalStates.find(s => s.type === 'fileChooser');
+          if (fileChooserState) instance.clearModalState(fileChooserState);
+          
           return text(`✅ Uploaded ${(args?.paths as string[]).length} file(s) to [ref=${args?.ref}]`);
         }
 
         case 'page_fill_form': {
           const instance = manager.getInstance(args?.instanceId as string);
-          const fields = args?.fields as Array<{ ref: string; value: string }>;
+          const fields = args?.fields as Array<{ ref: string; type?: string; value: string }>;
+          
+          // Aligned with official: handle different field types
           for (const field of fields) {
             const locator = getLocator(instance, field.ref);
-            await locator.fill(field.value);
+            const fieldType = field.type || 'textbox';
+            
+            if (fieldType === 'textbox' || fieldType === 'slider') {
+              await locator.fill(field.value);
+            } else if (fieldType === 'checkbox' || fieldType === 'radio') {
+              await locator.setChecked(field.value === 'true');
+            } else if (fieldType === 'combobox') {
+              await locator.selectOption({ label: field.value });
+            } else {
+              await locator.fill(field.value);
+            }
           }
+          
           return text(`✅ Filled ${fields.length} form field(s)`);
         }
 
@@ -754,7 +865,23 @@ export function createServer(config: ServerConfig = {}): Server {
           const instance = manager.getInstance(args?.instanceId as string);
           const accept = args?.accept as boolean;
           const promptText = args?.promptText as string | undefined;
-          // Set up dialog handler for the next dialog
+          
+          // Aligned with official: find and handle the actual dialog modal state
+          const dialogState = instance.modalStates.find(s => s.type === 'dialog');
+          if (dialogState?.dialog) {
+            instance.clearModalState(dialogState);
+            // Aligned with official: use waitForCompletion around dialog handling
+            await instance.waitForCompletion(async () => {
+              if (accept) {
+                await dialogState.dialog!.accept(promptText);
+              } else {
+                await dialogState.dialog!.dismiss();
+              }
+            });
+            return text(`✅ Dialog ${accept ? 'accepted' : 'dismissed'}${promptText ? ` with text "${promptText}"` : ''}`);
+          }
+          
+          // Fallback: set up handler for next dialog
           instance.page.once('dialog', async (dialog) => {
             if (accept) {
               await dialog.accept(promptText);
@@ -771,8 +898,10 @@ export function createServer(config: ServerConfig = {}): Server {
           const levelOrder = ['error', 'warning', 'info', 'debug'];
           const maxLevel = levelOrder.indexOf(level);
           const typeToLevel: Record<string, number> = {
-            'error': 0, 'warning': 1, 'warn': 1,
-            'info': 2, 'log': 2, 'debug': 3, 'trace': 3,
+            'assert': 0, 'error': 0, 
+            'warning': 1, 'warn': 1,
+            'info': 2, 'log': 2, 'table': 2, 'count': 2, 'time': 2, 'timeEnd': 2,
+            'debug': 3, 'trace': 3, 'dir': 3, 'dirxml': 3,
           };
           const filtered = instance.consoleMessages.filter(m => {
             const msgLevel = typeToLevel[m.type] ?? 2;
@@ -805,34 +934,47 @@ export function createServer(config: ServerConfig = {}): Server {
         case 'page_run_code': {
           const instance = manager.getInstance(args?.instanceId as string);
           const code = args?.code as string;
-          const fn = new Function('page', `return (${code})(page);`);
-          const result = await fn(instance.page);
+          let result: any;
+          // Aligned with official: use waitForCompletion
+          await instance.waitForCompletion(async () => {
+            const fn = new Function('page', `return (${code})(page);`);
+            result = await fn(instance.page);
+          });
           return text(`Result:\n${JSON.stringify(result, null, 2)}`);
         }
 
         case 'page_mouse_click_xy': {
           const instance = manager.getInstance(args?.instanceId as string);
-          await instance.page.mouse.click(
-            args?.x as number,
-            args?.y as number,
-            { button: (args?.button as any) || 'left' }
-          );
+          // Aligned with official: use waitForCompletion
+          await instance.waitForCompletion(async () => {
+            await instance.page.mouse.click(
+              args?.x as number,
+              args?.y as number,
+              { button: (args?.button as any) || 'left' }
+            );
+          });
           return text(`✅ Clicked at (${args?.x}, ${args?.y})`);
         }
 
         case 'page_mouse_move_xy': {
           const instance = manager.getInstance(args?.instanceId as string);
-          await instance.page.mouse.move(args?.x as number, args?.y as number);
+          // Aligned with official: use waitForCompletion
+          await instance.waitForCompletion(async () => {
+            await instance.page.mouse.move(args?.x as number, args?.y as number);
+          });
           return text(`✅ Mouse moved to (${args?.x}, ${args?.y})`);
         }
 
         case 'page_mouse_drag_xy': {
           const instance = manager.getInstance(args?.instanceId as string);
           const page = instance.page;
-          await page.mouse.move(args?.startX as number, args?.startY as number);
-          await page.mouse.down();
-          await page.mouse.move(args?.endX as number, args?.endY as number, { steps: 10 });
-          await page.mouse.up();
+          // Aligned with official: use waitForCompletion
+          await instance.waitForCompletion(async () => {
+            await page.mouse.move(args?.startX as number, args?.startY as number);
+            await page.mouse.down();
+            await page.mouse.move(args?.endX as number, args?.endY as number);
+            await page.mouse.up();
+          });
           return text(`✅ Dragged from (${args?.startX},${args?.startY}) to (${args?.endX},${args?.endY})`);
         }
 
@@ -882,8 +1024,20 @@ export function createServer(config: ServerConfig = {}): Server {
 
         case 'page_generate_locator': {
           const instance = manager.getInstance(args?.instanceId as string);
-          const info = instance.refMap.get(args?.ref as string);
-          if (!info) return error(`Ref "${args?.ref}" not found.`);
+          const ref = args?.ref as string;
+          
+          try {
+            // Try native toCode() first (available with aria-ref= locator)
+            const locator = getLocator(instance, ref);
+            const code = await (locator as any).toCode?.();
+            if (code) {
+              return text(`Locator for [ref=${ref}]:\npage.${code}`);
+            }
+          } catch {}
+          
+          // Fallback to legacy
+          const info = instance.refMap.get(ref);
+          if (!info) return error(`Ref "${ref}" not found.`);
           let locatorStr: string;
           if (info.name) {
             locatorStr = `page.getByRole('${info.role}', { name: '${info.name}' })`;
@@ -893,7 +1047,7 @@ export function createServer(config: ServerConfig = {}): Server {
           if (info.globalIndex > 0) {
             locatorStr += `.nth(${info.globalIndex})`;
           }
-          return text(`Locator for [ref=${args?.ref}]:\n${locatorStr}`);
+          return text(`Locator for [ref=${ref}]:\n${locatorStr}`);
         }
 
         case 'page_start_tracing': {

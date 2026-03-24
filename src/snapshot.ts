@@ -1,11 +1,54 @@
 /**
  * Page Snapshot Utilities
  * 
- * Takes accessibility snapshots of pages and provides ref-based element targeting.
- * Uses Playwright's accessibility tree for structure and getByRole for element location.
+ * Takes accessibility snapshots of pages using Playwright's native snapshotForAI() API
+ * and provides ref-based element targeting via the built-in aria-ref= locator system.
+ * 
+ * Aligned with the official Playwright MCP implementation.
  */
 import { Page, Locator } from 'playwright';
-import { BrowserInstance, RefInfo } from './manager.js';
+import { BrowserInstance } from './manager.js';
+
+/**
+ * Take an accessibility snapshot of the page using Playwright's native snapshotForAI().
+ * Returns the structured YAML-like aria snapshot text with [ref=eN] markers.
+ */
+export async function takeSnapshot(instance: BrowserInstance): Promise<string> {
+  const page = instance.page;
+
+  try {
+    // Use Playwright's native snapshotForAI() which returns aria snapshot with refs
+    const snapshot = await (page as any).snapshotForAI({ track: 'response' });
+    
+    // Store the full snapshot for reference
+    instance.lastSnapshot = snapshot.full || snapshot;
+    instance.lastSnapshotDiff = snapshot.incremental;
+    
+    return typeof snapshot === 'string' ? snapshot : (snapshot.full || JSON.stringify(snapshot));
+  } catch (e: any) {
+    // Fallback: try the older accessibility.snapshot() API
+    console.error(`snapshotForAI not available, falling back to accessibility.snapshot(): ${e.message}`);
+    return await takeSnapshotLegacy(instance);
+  }
+}
+
+/**
+ * Get a Playwright Locator for a ref from the snapshot.
+ * Uses the native aria-ref= locator system built into Playwright.
+ */
+export function getLocator(instance: BrowserInstance, ref: string): Locator {
+  const page = instance.page;
+  
+  try {
+    // Use Playwright's native aria-ref= locator (the same as official MCP)
+    return page.locator(`aria-ref=${ref}`);
+  } catch (e: any) {
+    // Fallback to legacy ref map
+    return getLocatorLegacy(instance, ref);
+  }
+}
+
+// ────────── Legacy Fallback (for older Playwright versions) ──────────
 
 interface A11yNode {
   role: string;
@@ -21,29 +64,6 @@ interface A11yNode {
   children?: A11yNode[];
 }
 
-/**
- * Take an accessibility snapshot of the page, assign refs to interactive nodes,
- * and return a formatted text representation.
- */
-export async function takeSnapshot(instance: BrowserInstance): Promise<string> {
-  // Clear previous refs
-  instance.clearRefs();
-
-  // @ts-ignore - accessibility API exists at runtime but types may vary across versions
-  const snapshot = await (instance.page as any).accessibility.snapshot() as A11yNode | null;
-  if (!snapshot) {
-    return '(empty page - no accessible content)';
-  }
-
-  // Track role+name counts for disambiguation
-  const globalCounts = new Map<string, number>();
-
-  const lines: string[] = [];
-  processNode(snapshot, 0, instance, globalCounts, lines);
-  
-  return lines.join('\n');
-}
-
 const INTERACTIVE_ROLES = new Set([
   'link', 'button', 'textbox', 'searchbox', 'combobox',
   'checkbox', 'radio', 'switch', 'slider', 'spinbutton',
@@ -52,8 +72,20 @@ const INTERACTIVE_ROLES = new Set([
   'cell', 'columnheader', 'rowheader', 'row',
 ]);
 
-function isInteractive(role: string): boolean {
-  return INTERACTIVE_ROLES.has(role);
+async function takeSnapshotLegacy(instance: BrowserInstance): Promise<string> {
+  instance.clearRefs();
+
+  // @ts-ignore
+  const snapshot = await (instance.page as any).accessibility.snapshot() as A11yNode | null;
+  if (!snapshot) {
+    return '(empty page - no accessible content)';
+  }
+
+  const globalCounts = new Map<string, number>();
+  const lines: string[] = [];
+  processNode(snapshot, 0, instance, globalCounts, lines);
+  
+  return lines.join('\n');
 }
 
 function processNode(
@@ -64,9 +96,8 @@ function processNode(
   lines: string[],
 ): void {
   const indent = '  '.repeat(depth);
-  const interactive = isInteractive(node.role);
+  const interactive = INTERACTIVE_ROLES.has(node.role);
 
-  // Assign ref to interactive elements
   let refStr = '';
   if (interactive) {
     const ref = `e${instance.refCounter}`;
@@ -85,11 +116,9 @@ function processNode(
     refStr = ` [ref=${ref}]`;
   }
 
-  // Build line
   let line = `${indent}- ${node.role}`;
   if (node.name) line += ` "${truncate(node.name, 80)}"`;
   
-  // Attributes
   const attrs: string[] = [];
   if (node.value !== undefined) attrs.push(`value="${truncate(node.value, 50)}"`);
   if (node.level !== undefined) attrs.push(`level=${node.level}`);
@@ -105,7 +134,6 @@ function processNode(
 
   lines.push(line);
 
-  // Process children
   if (node.children) {
     for (const child of node.children) {
       processNode(child, depth + 1, instance, globalCounts, lines);
@@ -113,10 +141,7 @@ function processNode(
   }
 }
 
-/**
- * Get a Playwright Locator for a ref from the snapshot.
- */
-export function getLocator(instance: BrowserInstance, ref: string): Locator {
+function getLocatorLegacy(instance: BrowserInstance, ref: string): Locator {
   const info = instance.refMap.get(ref);
   if (!info) {
     const available = Array.from(instance.refMap.keys()).slice(0, 10).join(', ');
@@ -129,14 +154,12 @@ export function getLocator(instance: BrowserInstance, ref: string): Locator {
   const page = instance.page;
   let locator: Locator;
 
-  // Build locator from role and name
   if (info.name) {
     locator = page.getByRole(info.role as any, { name: info.name });
   } else {
     locator = page.getByRole(info.role as any);
   }
 
-  // Use nth() to disambiguate if there are multiple matches
   if (info.globalIndex > 0) {
     locator = locator.nth(info.globalIndex);
   }
